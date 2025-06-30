@@ -1,0 +1,797 @@
+# 폐쇄망 환경 RHEL 9.4 Kubernetes 설치 가이드
+
+## 개요
+
+이 가이드는 인터넷 접속이 불가능한 폐쇄망(Air-Gap) 환경에서 RHEL 9.4에 Kubernetes 1.29와 관련 애플리케이션들을 설치하는 방법을 제공합니다.
+
+### 설치 구성 요소
+- **Kubernetes 1.29** (containerd + podman)
+- **Rancher UI** - Kubernetes 관리 웹 인터페이스
+- **AWX** - Ansible Tower 오픈소스 버전
+- **Apache Kafka** - 메시지 브로커
+- **Harbor** - 컨테이너 레지스트리
+
+### 폐쇄망 환경 요구사항
+- RHEL 9.4 (최소 4GB RAM, 2 CPU 코어, 100GB 디스크)
+- 내부 컨테이너 레지스트리 (Harbor 또는 기타)
+- 내부 DNS 서버 (선택사항)
+- 파일 전송을 위한 USB/외부 저장소
+
+---
+
+## 사전 준비 작업 (온라인 환경에서)
+
+### 1. 필요한 파일들 다운로드
+
+온라인 환경에서 다음 파일들을 미리 다운로드해야 합니다:
+
+#### 1.1 시스템 패키지 (RPM)
+
+```bash
+# 온라인 환경에서 실행
+mkdir -p airgap-packages/{rpms,containers,helm-charts,binaries,manifests}
+
+# RHEL 9.4 패키지 다운로드
+dnf download --resolve --destdir airgap-packages/rpms \
+  containerd \
+  podman \
+  git \
+  curl \
+  wget \
+  vim \
+  tar \
+  gzip \
+  socat \
+  conntrack \
+  ipset \
+  iptables
+
+# Kubernetes 저장소 설정 후 패키지 다운로드
+cat <<EOF > /etc/yum.repos.d/kubernetes.repo
+[kubernetes]
+name=Kubernetes
+baseurl=https://pkgs.k8s.io/core:/stable:/v1.29/rpm/
+enabled=1
+gpgcheck=1
+gpgkey=https://pkgs.k8s.io/core:/stable:/v1.29/rpm/repodata/repomd.xml.key
+EOF
+
+dnf download --resolve --destdir airgap-packages/rpms \
+  kubelet-1.29.* \
+  kubeadm-1.29.* \
+  kubectl-1.29.*
+```
+
+#### 1.2 컨테이너 이미지 목록
+
+```bash
+# container-images.txt 파일 생성
+cat <<EOF > airgap-packages/container-images.txt
+# Kubernetes 시스템 이미지
+registry.k8s.io/kube-apiserver:v1.29.0
+registry.k8s.io/kube-controller-manager:v1.29.0
+registry.k8s.io/kube-scheduler:v1.29.0
+registry.k8s.io/kube-proxy:v1.29.0
+registry.k8s.io/pause:3.9
+registry.k8s.io/etcd:3.5.10-0
+registry.k8s.io/coredns/coredns:v1.11.1
+
+# CNI 이미지
+docker.io/flannel/flannel:v0.24.0
+docker.io/flannel/flannel-cni-plugin:v1.2.0
+
+# Rancher 이미지
+rancher/rancher:v2.8.0
+rancher/rancher-agent:v2.8.0
+quay.io/jetstack/cert-manager-controller:v1.13.0
+quay.io/jetstack/cert-manager-webhook:v1.13.0
+quay.io/jetstack/cert-manager-cainjector:v1.13.0
+
+# AWX 이미지
+quay.io/ansible/awx:23.5.0
+quay.io/ansible/awx-operator:2.7.0
+docker.io/postgres:13
+docker.io/redis:7
+
+# Kafka 이미지
+quay.io/strimzi/operator:0.38.0
+quay.io/strimzi/kafka:0.38.0-kafka-3.6.0
+
+# Harbor 이미지
+goharbor/harbor-core:v2.9.0
+goharbor/harbor-portal:v2.9.0
+goharbor/harbor-jobservice:v2.9.0
+goharbor/registry-photon:v2.9.0
+goharbor/harbor-registryctl:v2.9.0
+goharbor/harbor-db:v2.9.0
+goharbor/redis-photon:v2.9.0
+goharbor/trivy-adapter-photon:v2.9.0
+goharbor/chartmuseum-photon:v2.9.0
+goharbor/notary-server-photon:v2.9.0
+goharbor/notary-signer-photon:v2.9.0
+EOF
+```
+
+#### 1.3 컨테이너 이미지 다운로드 스크립트
+
+```bash
+# download-images.sh
+cat <<'EOF' > airgap-packages/download-images.sh
+#!/bin/bash
+set -e
+
+IMAGES_FILE="container-images.txt"
+OUTPUT_DIR="container-images"
+
+mkdir -p $OUTPUT_DIR
+
+echo "컨테이너 이미지 다운로드 시작..."
+
+while IFS= read -r image; do
+    if [[ $image =~ ^#.*$ ]] || [[ -z "$image" ]]; then
+        continue
+    fi
+    
+    echo "다운로드 중: $image"
+    
+    # 이미지 이름에서 특수문자 제거하여 파일명 생성
+    filename=$(echo $image | sed 's/[^a-zA-Z0-9._-]/_/g')
+    
+    # 이미지 pull 및 save
+    podman pull $image
+    podman save -o "$OUTPUT_DIR/${filename}.tar" $image
+    
+    echo "저장 완료: $OUTPUT_DIR/${filename}.tar"
+done < $IMAGES_FILE
+
+echo "모든 이미지 다운로드 완료!"
+EOF
+
+chmod +x airgap-packages/download-images.sh
+```
+
+#### 1.4 바이너리 파일들
+
+```bash
+# Helm 다운로드
+cd airgap-packages/binaries
+wget https://get.helm.sh/helm-v3.12.0-linux-amd64.tar.gz
+
+# cri-tools 다운로드
+wget https://github.com/kubernetes-sigs/cri-tools/releases/download/v1.29.0/crictl-v1.29.0-linux-amd64.tar.gz
+
+# runc 다운로드
+wget https://github.com/opencontainers/runc/releases/download/v1.1.9/runc.amd64
+
+# CNI plugins 다운로드
+wget https://github.com/containernetworking/plugins/releases/download/v1.3.0/cni-plugins-linux-amd64-v1.3.0.tgz
+```
+
+#### 1.5 Helm 차트들
+
+```bash
+# Helm 차트 다운로드
+cd airgap-packages/helm-charts
+
+# cert-manager
+helm repo add jetstack https://charts.jetstack.io
+helm repo update
+helm pull jetstack/cert-manager --version v1.13.0
+
+# Rancher
+helm repo add rancher-latest https://releases.rancher.com/server-charts/latest
+helm pull rancher-latest/rancher --version v2.8.0
+
+# Harbor
+helm repo add harbor https://helm.goharbor.io
+helm pull harbor/harbor --version 1.13.0
+
+# Strimzi Kafka
+wget https://github.com/strimzi/strimzi-kafka-operator/releases/download/0.38.0/strimzi-0.38.0.tgz
+```
+
+#### 1.6 매니페스트 파일들
+
+```bash
+# 매니페스트 파일 다운로드
+cd airgap-packages/manifests
+
+# Flannel CNI
+wget https://raw.githubusercontent.com/flannel-io/flannel/master/Documentation/kube-flannel.yml
+
+# cert-manager CRDs
+wget https://github.com/cert-manager/cert-manager/releases/download/v1.13.0/cert-manager.crds.yaml
+
+# Strimzi CRDs
+wget https://github.com/strimzi/strimzi-kafka-operator/releases/download/0.38.0/strimzi-cluster-operator-0.38.0.yaml
+```
+
+---
+
+## 폐쇄망 환경 설치 과정
+
+### 1. 사전 준비된 파일 전송
+
+USB나 다른 방법으로 `airgap-packages` 디렉토리를 폐쇄망 서버로 전송합니다.
+
+### 2. 시스템 기본 설정
+
+#### 2.1 오프라인 패키지 설치
+
+```bash
+# 전송된 패키지 디렉토리로 이동
+cd airgap-packages
+
+# RPM 패키지 설치
+sudo dnf install -y rpms/*.rpm
+
+# 의존성 문제가 있을 경우 강제 설치
+sudo rpm -ivh --force --nodeps rpms/*.rpm
+```
+
+#### 2.2 시스템 설정
+
+```bash
+# SELinux 설정
+sudo setenforce 0
+sudo sed -i 's/^SELINUX=enforcing$/SELINUX=permissive/' /etc/selinux/config
+
+# swap 비활성화
+sudo swapoff -a
+sudo sed -i '/ swap / s/^\(.*\)$/#\1/g' /etc/fstab
+
+# 방화벽 설정
+sudo firewall-cmd --permanent --add-port=6443/tcp
+sudo firewall-cmd --permanent --add-port=2379-2380/tcp
+sudo firewall-cmd --permanent --add-port=10250-10252/tcp
+sudo firewall-cmd --permanent --add-port=30000-32767/tcp
+sudo firewall-cmd --reload
+
+# 커널 모듈 및 네트워크 설정
+sudo modprobe br_netfilter
+echo 'br_netfilter' | sudo tee /etc/modules-load.d/k8s.conf
+
+cat <<EOF | sudo tee /etc/sysctl.d/k8s.conf
+net.bridge.bridge-nf-call-ip6tables = 1
+net.bridge.bridge-nf-call-iptables = 1
+net.ipv4.ip_forward = 1
+EOF
+sudo sysctl --system
+```
+
+### 3. 컨테이너 런타임 설정
+
+#### 3.1 Containerd 설정
+
+```bash
+# containerd 설정 디렉토리 생성
+sudo mkdir -p /etc/containerd
+
+# 기본 설정 생성
+containerd config default | sudo tee /etc/containerd/config.toml
+
+# SystemdCgroup 활성화
+sudo sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+
+# 내부 레지스트리 설정 (INTERNAL_REGISTRY를 실제 주소로 변경)
+cat <<EOF | sudo tee -a /etc/containerd/config.toml
+
+[plugins."io.containerd.grpc.v1.cri".registry]
+  [plugins."io.containerd.grpc.v1.cri".registry.mirrors]
+    [plugins."io.containerd.grpc.v1.cri".registry.mirrors."docker.io"]
+      endpoint = ["http://INTERNAL_REGISTRY:5000/docker.io"]
+    [plugins."io.containerd.grpc.v1.cri".registry.mirrors."registry.k8s.io"]
+      endpoint = ["http://INTERNAL_REGISTRY:5000/registry.k8s.io"]
+    [plugins."io.containerd.grpc.v1.cri".registry.mirrors."quay.io"]
+      endpoint = ["http://INTERNAL_REGISTRY:5000/quay.io"]
+    [plugins."io.containerd.grpc.v1.cri".registry.mirrors."gcr.io"]
+      endpoint = ["http://INTERNAL_REGISTRY:5000/gcr.io"]
+  [plugins."io.containerd.grpc.v1.cri".registry.configs]
+    [plugins."io.containerd.grpc.v1.cri".registry.configs."INTERNAL_REGISTRY:5000".tls]
+      insecure_skip_verify = true
+EOF
+
+# containerd 서비스 시작
+sudo systemctl restart containerd
+sudo systemctl enable containerd
+```
+
+#### 3.2 바이너리 설치
+
+```bash
+# Helm 설치
+cd binaries
+tar -zxvf helm-v3.12.0-linux-amd64.tar.gz
+sudo mv linux-amd64/helm /usr/local/bin/
+
+# crictl 설치
+tar -zxvf crictl-v1.29.0-linux-amd64.tar.gz
+sudo mv crictl /usr/local/bin/
+
+# runc 설치
+sudo mv runc.amd64 /usr/local/bin/runc
+sudo chmod +x /usr/local/bin/runc
+
+# CNI plugins 설치
+sudo mkdir -p /opt/cni/bin
+sudo tar -zxvf cni-plugins-linux-amd64-v1.3.0.tgz -C /opt/cni/bin
+```
+
+### 4. 내부 컨테이너 레지스트리 구성
+
+#### 4.1 컨테이너 이미지 로드 및 푸시
+
+```bash
+# 이미지 로드 스크립트 생성
+cat <<'EOF' > load-and-push-images.sh
+#!/bin/bash
+set -e
+
+INTERNAL_REGISTRY="INTERNAL_REGISTRY:5000"  # 실제 내부 레지스트리 주소로 변경
+IMAGES_DIR="container-images"
+
+echo "컨테이너 이미지 로드 및 푸시 시작..."
+
+for tar_file in $IMAGES_DIR/*.tar; do
+    if [ -f "$tar_file" ]; then
+        echo "로드 중: $tar_file"
+        podman load -i "$tar_file"
+    fi
+done
+
+# 로드된 이미지들을 내부 레지스트리로 푸시
+podman images --format "table {{.Repository}} {{.Tag}}" | grep -v REPOSITORY | while read repo tag; do
+    if [[ "$repo" != "<none>" && "$tag" != "<none>" ]]; then
+        original_image="$repo:$tag"
+        
+        # 내부 레지스트리 태그 생성
+        if [[ $repo == registry.k8s.io/* ]]; then
+            new_repo="${INTERNAL_REGISTRY}/registry.k8s.io/${repo#registry.k8s.io/}"
+        elif [[ $repo == docker.io/* ]]; then
+            new_repo="${INTERNAL_REGISTRY}/docker.io/${repo#docker.io/}"
+        elif [[ $repo == quay.io/* ]]; then
+            new_repo="${INTERNAL_REGISTRY}/quay.io/${repo#quay.io/}"
+        elif [[ $repo == gcr.io/* ]]; then
+            new_repo="${INTERNAL_REGISTRY}/gcr.io/${repo#gcr.io/}"
+        elif [[ $repo == goharbor/* ]]; then
+            new_repo="${INTERNAL_REGISTRY}/goharbor/${repo#goharbor/}"
+        else
+            new_repo="${INTERNAL_REGISTRY}/docker.io/$repo"
+        fi
+        
+        new_image="$new_repo:$tag"
+        
+        echo "태깅: $original_image -> $new_image"
+        podman tag "$original_image" "$new_image"
+        
+        echo "푸시: $new_image"
+        podman push "$new_image" --tls-verify=false
+    fi
+done
+
+echo "모든 이미지 푸시 완료!"
+EOF
+
+chmod +x load-and-push-images.sh
+```
+
+#### 4.2 이미지 로드 및 푸시 실행
+
+```bash
+# 스크립트에서 INTERNAL_REGISTRY를 실제 주소로 변경 후 실행
+./load-and-push-images.sh
+```
+
+### 5. Kubernetes 클러스터 설치
+
+#### 5.1 kubeadm 설정 파일 생성
+
+```bash
+# kubeadm 설정 파일 생성 (NODE_IP와 INTERNAL_REGISTRY를 실제 값으로 변경)
+cat <<EOF > kubeadm-config.yaml
+apiVersion: kubeadm.k8s.io/v1beta3
+kind: InitConfiguration
+localAPIEndpoint:
+  advertiseAddress: "NODE_IP"
+nodeRegistration:
+  criSocket: unix:///var/run/containerd/containerd.sock
+---
+apiVersion: kubeadm.k8s.io/v1beta3
+kind: ClusterConfiguration
+kubernetesVersion: v1.29.0
+imageRepository: INTERNAL_REGISTRY:5000/registry.k8s.io
+networking:
+  podSubnet: "10.244.0.0/16"
+---
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+cgroupDriver: systemd
+EOF
+```
+
+#### 5.2 클러스터 초기화
+
+```bash
+# Kubernetes 서비스 활성화
+sudo systemctl enable kubelet
+
+# 클러스터 초기화
+sudo kubeadm init --config=kubeadm-config.yaml
+
+# kubectl 설정
+mkdir -p $HOME/.kube
+sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+sudo chown $(id -u):$(id -g) $HOME/.kube/config
+
+# 단일 노드 클러스터를 위한 taint 제거
+kubectl taint nodes --all node-role.kubernetes.io/control-plane- || true
+```
+
+#### 5.3 CNI 플러그인 설치 (Flannel)
+
+```bash
+# Flannel 매니페스트 수정
+cd manifests
+cp kube-flannel.yml kube-flannel-custom.yml
+
+# 이미지 경로를 내부 레지스트리로 변경
+sed -i "s|docker.io/flannel/flannel:|INTERNAL_REGISTRY:5000/docker.io/flannel/flannel:|g" kube-flannel-custom.yml
+sed -i "s|docker.io/flannel/flannel-cni-plugin:|INTERNAL_REGISTRY:5000/docker.io/flannel/flannel-cni-plugin:|g" kube-flannel-custom.yml
+
+# Flannel 설치
+kubectl apply -f kube-flannel-custom.yml
+```
+
+### 6. 애플리케이션 설치
+
+#### 6.1 Harbor 설치 (내부 레지스트리로 사용)
+
+```bash
+# Harbor 네임스페이스 생성
+kubectl create namespace harbor
+
+# Harbor Helm 차트 압축 해제
+cd helm-charts
+tar -zxf harbor-1.13.0.tgz
+
+# Harbor values 파일 생성 (NODE_IP를 실제 값으로 변경)
+cat <<EOF > harbor-values.yaml
+expose:
+  type: nodePort
+  nodePort:
+    ports:
+      http:
+        nodePort: 30002
+      https:
+        nodePort: 30003
+
+externalURL: http://NODE_IP:30002
+harborAdminPassword: "Harbor12345"
+
+# 내부 레지스트리 이미지 사용
+core:
+  image:
+    repository: INTERNAL_REGISTRY:5000/goharbor/harbor-core
+    tag: v2.9.0
+
+portal:
+  image:
+    repository: INTERNAL_REGISTRY:5000/goharbor/harbor-portal
+    tag: v2.9.0
+
+jobservice:
+  image:
+    repository: INTERNAL_REGISTRY:5000/goharbor/harbor-jobservice
+    tag: v2.9.0
+
+registry:
+  image:
+    repository: INTERNAL_REGISTRY:5000/goharbor/registry-photon
+    tag: v2.9.0
+
+registryctl:
+  image:
+    repository: INTERNAL_REGISTRY:5000/goharbor/harbor-registryctl
+    tag: v2.9.0
+
+database:
+  internal:
+    image:
+      repository: INTERNAL_REGISTRY:5000/goharbor/harbor-db
+      tag: v2.9.0
+
+redis:
+  internal:
+    image:
+      repository: INTERNAL_REGISTRY:5000/goharbor/redis-photon
+      tag: v2.9.0
+
+trivy:
+  image:
+    repository: INTERNAL_REGISTRY:5000/goharbor/trivy-adapter-photon
+    tag: v2.9.0
+EOF
+
+# Harbor 설치
+helm install harbor ./harbor -n harbor -f harbor-values.yaml
+```
+
+#### 6.2 cert-manager 설치
+
+```bash
+# cert-manager 네임스페이스 생성
+kubectl create namespace cert-manager
+
+# cert-manager CRDs 설치
+kubectl apply -f manifests/cert-manager.crds.yaml
+
+# cert-manager Helm 차트 설치
+tar -zxf cert-manager-v1.13.0.tgz
+
+# cert-manager values 파일 생성
+cat <<EOF > cert-manager-values.yaml
+image:
+  repository: INTERNAL_REGISTRY:5000/quay.io/jetstack/cert-manager-controller
+  tag: v1.13.0
+
+webhook:
+  image:
+    repository: INTERNAL_REGISTRY:5000/quay.io/jetstack/cert-manager-webhook
+    tag: v1.13.0
+
+cainjector:
+  image:
+    repository: INTERNAL_REGISTRY:5000/quay.io/jetstack/cert-manager-cainjector
+    tag: v1.13.0
+
+startupapicheck:
+  image:
+    repository: INTERNAL_REGISTRY:5000/quay.io/jetstack/cert-manager-ctl
+    tag: v1.13.0
+EOF
+
+helm install cert-manager ./cert-manager -n cert-manager -f cert-manager-values.yaml
+```
+
+#### 6.3 Rancher 설치
+
+```bash
+# Rancher 네임스페이스 생성
+kubectl create namespace cattle-system
+
+# Rancher Helm 차트 설치
+tar -zxf rancher-2.8.0.tgz
+
+# Rancher values 파일 생성 (RANCHER_HOST를 실제 값으로 변경)
+cat <<EOF > rancher-values.yaml
+hostname: RANCHER_HOST
+replicas: 1
+rancherImage: INTERNAL_REGISTRY:5000/rancher/rancher
+rancherImageTag: v2.8.0
+systemDefaultRegistry: INTERNAL_REGISTRY:5000
+useBundledSystemChart: true
+
+# 추가 설정
+addLocal: "true"
+antiAffinity: "preferred"
+topologyKey: "kubernetes.io/hostname"
+EOF
+
+helm install rancher ./rancher -n cattle-system -f rancher-values.yaml
+```
+
+#### 6.4 AWX 설치
+
+```bash
+# AWX 네임스페이스 생성
+kubectl create namespace awx
+
+# AWX Operator 매니페스트 생성
+cat <<EOF | kubectl apply -f -
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: awx-operator
+  namespace: awx
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      name: awx-operator
+  template:
+    metadata:
+      labels:
+        name: awx-operator
+    spec:
+      serviceAccountName: awx-operator
+      containers:
+      - name: awx-operator
+        image: INTERNAL_REGISTRY:5000/quay.io/ansible/awx-operator:2.7.0
+        command:
+        - /manager
+        env:
+        - name: WATCH_NAMESPACE
+          value: awx
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: awx-operator
+  namespace: awx
+EOF
+
+# AWX 인스턴스 생성
+cat <<EOF | kubectl apply -f -
+apiVersion: awx.ansible.com/v1beta1
+kind: AWX
+metadata:
+  name: awx
+  namespace: awx
+spec:
+  service_type: nodeport
+  nodeport_port: 30080
+  image: INTERNAL_REGISTRY:5000/quay.io/ansible/awx
+  image_version: "23.5.0"
+  postgres_image: INTERNAL_REGISTRY:5000/docker.io/postgres
+  postgres_image_version: "13"
+  redis_image: INTERNAL_REGISTRY:5000/docker.io/redis
+  redis_image_version: "7"
+EOF
+```
+
+#### 6.5 Kafka 설치
+
+```bash
+# Kafka 네임스페이스 생성
+kubectl create namespace kafka
+
+# Strimzi Operator 매니페스트 수정
+cp manifests/strimzi-cluster-operator-0.38.0.yaml strimzi-custom.yaml
+
+# 이미지 경로를 내부 레지스트리로 변경
+sed -i "s|quay.io/strimzi/|INTERNAL_REGISTRY:5000/quay.io/strimzi/|g" strimzi-custom.yaml
+
+# Strimzi Operator 설치
+kubectl apply -f strimzi-custom.yaml -n kafka
+
+# Kafka 클러스터 생성
+cat <<EOF | kubectl apply -f -
+apiVersion: kafka.strimzi.io/v1beta2
+kind: Kafka
+metadata:
+  name: my-cluster
+  namespace: kafka
+spec:
+  kafka:
+    version: 3.6.0
+    replicas: 1
+    image: INTERNAL_REGISTRY:5000/quay.io/strimzi/kafka:0.38.0-kafka-3.6.0
+    listeners:
+      - name: plain
+        port: 9092
+        type: internal
+        tls: false
+      - name: external
+        port: 9094
+        type: nodeport
+        tls: false
+    config:
+      offsets.topic.replication.factor: 1
+      transaction.state.log.replication.factor: 1
+      transaction.state.log.min.isr: 1
+    storage:
+      type: jbod
+      volumes:
+      - id: 0
+        type: persistent-claim
+        size: 10Gi
+  zookeeper:
+    replicas: 1
+    image: INTERNAL_REGISTRY:5000/quay.io/strimzi/kafka:0.38.0-kafka-3.6.0
+    storage:
+      type: persistent-claim
+      size: 10Gi
+  entityOperator:
+    topicOperator:
+      image: INTERNAL_REGISTRY:5000/quay.io/strimzi/operator:0.38.0
+    userOperator:
+      image: INTERNAL_REGISTRY:5000/quay.io/strimzi/operator:0.38.0
+EOF
+```
+
+### 7. 설치 검증
+
+#### 7.1 클러스터 상태 확인
+
+```bash
+# 노드 상태 확인
+kubectl get nodes
+
+# 모든 Pod 상태 확인
+kubectl get pods --all-namespaces
+
+# 서비스 상태 확인
+kubectl get svc --all-namespaces
+```
+
+#### 7.2 각 애플리케이션 상태 확인
+
+```bash
+# Harbor 상태
+kubectl get pods -n harbor
+
+# Rancher 상태
+kubectl get pods -n cattle-system
+
+# AWX 상태
+kubectl get pods -n awx
+
+# Kafka 상태
+kubectl get pods -n kafka
+```
+
+### 8. 접속 정보 및 초기 설정
+
+#### 8.1 접속 URL
+
+- **Harbor**: `http://NODE_IP:30002` (admin/Harbor12345)
+- **Rancher**: `https://RANCHER_HOST` 
+- **AWX**: `http://NODE_IP:30080`
+- **Kafka**: `my-cluster-kafka-bootstrap.kafka.svc:9092`
+
+#### 8.2 초기 비밀번호 확인
+
+```bash
+# Rancher 초기 비밀번호
+kubectl get secret --namespace cattle-system bootstrap-secret -o go-template='{{.data.bootstrapPassword|base64decode}}'
+
+# AWX 관리자 비밀번호
+kubectl get secret awx-admin-password -o jsonpath='{.data.password}' -n awx | base64 --decode
+```
+
+---
+
+## 폐쇄망 환경 운영 가이드
+
+### 1. 지속적인 이미지 관리
+
+#### 1.1 새로운 이미지 추가 프로세스
+
+```bash
+# 온라인 환경에서 새 이미지 다운로드
+podman pull new-application:latest
+podman save -o new-application.tar new-application:latest
+
+# 폐쇄망으로 전송 후
+podman load -i new-application.tar
+podman tag new-application:latest INTERNAL_REGISTRY:5000/new-application:latest
+podman push INTERNAL_REGISTRY:5000/new-application:latest --tls-verify=false
+```
+
+#### 1.2 이미지 정리 스크립트
+
+```bash
+#!/bin/bash
+# cleanup-images.sh
+
+echo "사용하지 않는 이미지 정리 중..."
+
+# 사용하지 않는 이미지 제거
+podman image prune -f
+
+# Dangling 이미지 제거
+podman rmi $(podman images -f "dangling=true" -q) 2>/dev/null || true
+
+echo "이미지 정리 완료"
+```
+
+### 2. 백업 및 복구
+
+#### 2.1 클러스터 백업
+
+```bash
+#!/bin/bash
+# backup-cluster.sh
+
+BACKUP_DIR="/backup/kubernetes/$(date +%Y%m%d_%H%M%S)"
+mkdir -p $
